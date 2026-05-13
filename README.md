@@ -13,6 +13,12 @@ Aplicacao web em Python para testar conectividade TCP, UDP e ICMP, com uso parec
 - Pacote Windows com servico nativo.
 - Pacote Linux para Ubuntu 25 com `systemd` e Nginx opcional.
 
+## Downloads
+
+- Windows: [NetworkProbe-Service.zip](https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Service.zip)
+- Linux `.tar.gz`: [NetworkProbe-Linux.tar.gz](https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Linux.tar.gz)
+- Linux `.zip`: [NetworkProbe-Linux.zip](https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Linux.zip)
+
 ## Estrutura
 
 ```text
@@ -21,17 +27,24 @@ service.py                     Host de servico Windows
 run.ps1                        Execucao local no Windows
 installer/                     Scripts de instalacao Windows
 linux/                         Scripts e guia Linux
-release/NetworkProbe-Service   Pacote Windows pronto
-release/NetworkProbe-Linux     Pacote Linux pronto
+release/NetworkProbe-Service.zip
+release/NetworkProbe-Linux.tar.gz
+release/NetworkProbe-Linux.zip
 ```
 
 ## Instalar no Windows
 
-Use o pacote pronto em `release/NetworkProbe-Service.zip`.
+Baixe o pacote pronto: [NetworkProbe-Service.zip](https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Service.zip).
 
-1. Extraia o arquivo ZIP.
-2. Abra o PowerShell como Administrador dentro da pasta extraida.
-3. Execute:
+Pelo PowerShell:
+
+```powershell
+Invoke-WebRequest -Uri "https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Service.zip" -OutFile "NetworkProbe-Service.zip"
+Expand-Archive .\NetworkProbe-Service.zip -DestinationPath .\NetworkProbe-Service -Force
+cd .\NetworkProbe-Service
+```
+
+Abra o PowerShell como Administrador dentro da pasta extraida e execute:
 
 ```powershell
 .\install-service.ps1
@@ -69,9 +82,10 @@ Quando `NetworkProbeService.exe` estiver no pacote, a maquina destino nao precis
 
 Base recomendada: Ubuntu 25 ou distribuicoes proximas com `systemd`.
 
-Use o pacote pronto em `release/NetworkProbe-Linux.tar.gz`.
+Baixe o pacote pronto: [NetworkProbe-Linux.tar.gz](https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Linux.tar.gz).
 
 ```bash
+curl -L -o NetworkProbe-Linux.tar.gz https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Linux.tar.gz
 tar -xzf NetworkProbe-Linux.tar.gz
 cd NetworkProbe-Linux
 sudo bash ./install.sh

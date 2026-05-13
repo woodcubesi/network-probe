@@ -2,6 +2,14 @@
 
 Pacote para Ubuntu 25 ou distribuicoes proximas baseadas em systemd.
 
+## Download
+
+```bash
+curl -L -o NetworkProbe-Linux.tar.gz https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Linux.tar.gz
+tar -xzf NetworkProbe-Linux.tar.gz
+cd NetworkProbe-Linux
+```
+
 ## Instalar como servico local
 
 ```bash

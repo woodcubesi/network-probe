@@ -2,6 +2,14 @@
 
 Este pacote instala o Network Probe como servico real do Windows usando `NetworkProbeService.exe`.
 
+## Download
+
+Baixe o pacote pronto:
+
+```text
+https://github.com/woodcubesi/network-probe/raw/main/release/NetworkProbe-Service.zip
+```
+
 ## Requisitos
 
 - Windows 10/11 ou Windows Server com PowerShell 5.1 ou superior.
