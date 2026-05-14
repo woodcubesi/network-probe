@@ -157,6 +157,8 @@ No modo `Port Scan`, informe portas como:
 ```text
 22,80,443
 1-1024
+1-65535
+all
 80,443,8000-8100
 ```
 

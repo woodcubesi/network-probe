@@ -18,7 +18,7 @@ import socket
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,7 +38,7 @@ MIN_TIMEOUT = 0.1
 MAX_TIMEOUT = 30.0
 MIN_INTERVAL = 0.0
 MAX_INTERVAL = 30.0
-MAX_SCAN_PORTS = 2048
+MAX_SCAN_PORTS = 65535
 MAX_SCAN_CONCURRENCY = 512
 
 
@@ -522,7 +522,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="scanFields" hidden>
           <label>
             Portas para scan
-            <input id="scanPorts" name="scan_ports" value="21,22,25,53,80,110,143,443,445,587,993,995,1433,3306,3389,5432,5900,8080,8081" placeholder="ex: 1-1024 ou 22,80,443,8000-8100" />
+            <input id="scanPorts" name="scan_ports" value="21,22,25,53,80,110,143,443,445,587,993,995,1433,3306,3389,5432,5900,8080,8081" placeholder="ex: 1-1024, 1-65535, all ou 22,80,443" />
           </label>
           <div class="grid-2">
             <label>
@@ -736,7 +736,7 @@ INDEX_HTML = r"""<!doctype html>
         lossLabel.textContent = "Fechadas";
         avgLabel.textContent = "Media";
         jitterLabel.textContent = "Progresso";
-        modeHint.textContent = "Port Scan faz conexoes TCP nas portas informadas e lista portas abertas. Use apenas em hosts autorizados.";
+        modeHint.textContent = "Port Scan faz conexoes TCP nas portas informadas e lista portas abertas. Use 1-65535, all, todas ou * para scan completo. Use apenas em hosts autorizados.";
         return;
       }
 
@@ -876,6 +876,13 @@ INDEX_HTML = r"""<!doctype html>
             });
           }
           updateScanSummary(result.summary);
+        });
+
+        source.addEventListener("scan_error", (event) => {
+          const payload = JSON.parse(event.data);
+          appendLine(payload.error || "Erro no Port Scan.", "fail");
+          setStatus("fail", "Erro");
+          closeSource();
         });
 
         source.addEventListener("scan_summary", (event) => {
@@ -1082,6 +1089,23 @@ def resolve_tcp_targets(host: str, port: int) -> list[tuple[int, int, int, tuple
     seen: set[tuple[int, tuple[Any, ...]]] = set()
     for family, socktype, proto, _canonname, sockaddr in targets:
         key = (family, sockaddr)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_targets.append((family, socktype, proto, sockaddr))
+    return unique_targets
+
+
+def replace_sockaddr_port(sockaddr: tuple[Any, ...], port: int) -> tuple[Any, ...]:
+    return (sockaddr[0], port, *sockaddr[2:])
+
+
+def resolve_tcp_scan_targets(host: str) -> list[tuple[int, int, int, tuple[Any, ...]]]:
+    targets = socket.getaddrinfo(host, 0, type=socket.SOCK_STREAM)
+    unique_targets: list[tuple[int, int, int, tuple[Any, ...]]] = []
+    seen: set[tuple[int, str, tuple[Any, ...]]] = set()
+    for family, socktype, proto, _canonname, sockaddr in targets:
+        key = (family, str(sockaddr[0]), tuple(sockaddr[2:]))
         if key in seen:
             continue
         seen.add(key)
@@ -1372,6 +1396,8 @@ def parse_ports(raw_ports: str | None) -> list[int]:
     text = (raw_ports or "").strip()
     if not text:
         raise ValueError("informe uma lista ou faixa de portas para scan")
+    if text.lower() in {"all", "todas", "todos", "*"}:
+        return list(range(1, 65536))
 
     ports: set[int] = set()
     for part in text.replace(" ", "").split(","):
@@ -1424,14 +1450,38 @@ def scan_summary(results: list[dict[str, Any]], total: int) -> dict[str, Any]:
     }
 
 
-def scan_tcp_port(host: str, port: int, timeout: float) -> dict[str, Any]:
+def scan_tcp_port(
+    host: str,
+    port: int,
+    timeout: float,
+    target_templates: list[tuple[int, int, int, tuple[Any, ...]]] | None = None,
+) -> dict[str, Any]:
     started = time.perf_counter()
     timestamp = time.time()
     attempts: list[dict[str, Any]] = []
 
-    try:
-        targets = resolve_tcp_targets(host, port)
-    except socket.gaierror as exc:
+    if target_templates is None:
+        try:
+            targets = resolve_tcp_targets(host, port)
+        except socket.gaierror as exc:
+            return {
+                "host": host,
+                "port": port,
+                "ok": False,
+                "status": "fail",
+                "latency_ms": None,
+                "peer": None,
+                "message": f"falha DNS: {exc}",
+                "attempts": attempts,
+                "timestamp": timestamp,
+            }
+    else:
+        targets = [
+            (family, socktype, proto, replace_sockaddr_port(sockaddr, port))
+            for family, socktype, proto, sockaddr in target_templates
+        ]
+
+    if not targets:
         return {
             "host": host,
             "port": port,
@@ -1439,7 +1489,7 @@ def scan_tcp_port(host: str, port: int, timeout: float) -> dict[str, Any]:
             "status": "fail",
             "latency_ms": None,
             "peer": None,
-            "message": f"falha DNS: {exc}",
+            "message": "nenhum endereco TCP encontrado no DNS",
             "attempts": attempts,
             "timestamp": timestamp,
         }
@@ -1492,13 +1542,71 @@ def scan_tcp_port(host: str, port: int, timeout: float) -> dict[str, Any]:
     }
 
 
-def run_port_scan(host: str, ports: list[int], timeout: float, concurrency: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+def failed_scan_result(host: str, port: int, message: str) -> dict[str, Any]:
+    return {
+        "host": host,
+        "port": port,
+        "ok": False,
+        "status": "fail",
+        "latency_ms": None,
+        "peer": None,
+        "message": message,
+        "attempts": [],
+        "timestamp": time.time(),
+    }
+
+
+def iter_port_scan_results(
+    host: str,
+    ports: list[int],
+    timeout: float,
+    concurrency: int,
+    target_templates: list[tuple[int, int, int, tuple[Any, ...]]],
+):
     max_workers = min(concurrency, len(ports))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(scan_tcp_port, host, port, timeout) for port in ports]
-        for future in as_completed(futures):
-            results.append(future.result())
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    pending: dict[Future[dict[str, Any]], int] = {}
+    port_iterator = iter(ports)
+
+    def submit_next() -> bool:
+        try:
+            port = next(port_iterator)
+        except StopIteration:
+            return False
+        future = executor.submit(scan_tcp_port, host, port, timeout, target_templates)
+        pending[future] = port
+        return True
+
+    try:
+        for _ in range(max_workers):
+            if not submit_next():
+                break
+
+        while pending:
+            done, _pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                port = pending.pop(future)
+                try:
+                    yield future.result()
+                except Exception as exc:  # defensive: keep stream alive if one worker fails unexpectedly
+                    yield failed_scan_result(host, port, f"erro interno ao testar porta: {exc}")
+                submit_next()
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def run_port_scan(
+    host: str,
+    ports: list[int],
+    timeout: float,
+    concurrency: int,
+    target_templates: list[tuple[int, int, int, tuple[Any, ...]]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for result in iter_port_scan_results(host, ports, timeout, concurrency, target_templates):
+        results.append(result)
     results.sort(key=lambda item: item["port"])
     return results, scan_summary(results, len(ports))
 
@@ -1586,8 +1694,16 @@ class TcpingHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
+        try:
+            target_templates = resolve_tcp_scan_targets(host)
+        except socket.gaierror as exc:
+            self.send_json({"error": f"falha DNS: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if not target_templates:
+            self.send_json({"error": "nenhum endereco TCP encontrado no DNS"}, status=HTTPStatus.BAD_REQUEST)
+            return
 
-        results, summary = run_port_scan(host, ports, timeout, concurrency)
+        results, summary = run_port_scan(host, ports, timeout, concurrency, target_templates)
         self.send_json(
             {
                 "target": {
@@ -1642,13 +1758,33 @@ class TcpingHandler(BaseHTTPRequestHandler):
         try:
             host, ports, timeout, concurrency, show_closed = self.parse_scan_request(raw_query)
         except ValueError as exc:
-            self.send_response(HTTPStatus.BAD_REQUEST)
+            self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.close_connection = True
             self.end_headers()
-            self.send_event("error", {"error": str(exc)})
+            self.send_event("scan_error", {"error": str(exc)})
+            return
+        try:
+            target_templates = resolve_tcp_scan_targets(host)
+        except socket.gaierror as exc:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            self.send_event("scan_error", {"error": f"falha DNS: {exc}"})
+            return
+        if not target_templates:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            self.send_event("scan_error", {"error": "nenhum endereco TCP encontrado no DNS"})
             return
 
         self.send_response(HTTPStatus.OK)
@@ -1659,18 +1795,12 @@ class TcpingHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         results: list[dict[str, Any]] = []
-        executor = ThreadPoolExecutor(max_workers=min(concurrency, len(ports)))
-        futures = [executor.submit(scan_tcp_port, host, port, timeout) for port in ports]
         try:
-            for future in as_completed(futures):
-                result = future.result()
+            for result in iter_port_scan_results(host, ports, timeout, concurrency, target_templates):
                 results.append(result)
                 result["summary"] = scan_summary(results, len(ports))
                 should_send = result.get("ok") or show_closed
                 if should_send and not self.send_event("scan_result", result):
-                    for pending in futures:
-                        pending.cancel()
-                    executor.shutdown(wait=False, cancel_futures=True)
                     return
                 if not should_send:
                     progress_event = {
@@ -1685,16 +1815,13 @@ class TcpingHandler(BaseHTTPRequestHandler):
                         "summary": result["summary"],
                     }
                     if not self.send_event("scan_result", progress_event):
-                        for pending in futures:
-                            pending.cancel()
-                        executor.shutdown(wait=False, cancel_futures=True)
                         return
             summary = scan_summary(results, len(ports))
             open_results = sorted([item for item in results if item.get("ok")], key=lambda item: item["port"])
             if not self.send_event("scan_summary", {**summary, "open_ports": [item["port"] for item in open_results]}):
                 return
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:
+            self.send_event("scan_error", {"error": f"erro interno no Port Scan: {exc}"})
 
     def send_html(self, html: str) -> None:
         body = html.encode("utf-8")
