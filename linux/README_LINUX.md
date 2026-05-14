@@ -71,4 +71,5 @@ sudo bash ./uninstall.sh
 - O servico roda com usuario dedicado `networkprobe`.
 - O backend usa apenas Python 3 e biblioteca padrao.
 - O modo ICMP usa o comando `ping` do sistema.
+- O modo Tracert usa `traceroute` ou `tracepath`; o instalador tenta instalar `traceroute` se nenhum deles existir.
 - O modo Port Scan faz TCP connect scan. Use apenas em hosts onde voce tem autorizacao.

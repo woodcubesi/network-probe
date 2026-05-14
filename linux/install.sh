@@ -131,6 +131,12 @@ then
   exit 1
 fi
 
+if ! command -v traceroute >/dev/null 2>&1 && ! command -v tracepath >/dev/null 2>&1; then
+  echo "traceroute/tracepath not found. Installing traceroute with apt..."
+  apt-get update
+  apt-get install -y traceroute
+fi
+
 if ! id -u "${SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --home-dir "${INSTALL_DIR}" --shell /usr/sbin/nologin "${SERVICE_USER}"
 fi

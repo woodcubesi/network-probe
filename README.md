@@ -8,6 +8,7 @@ Aplicacao web em Python para testar conectividade TCP, UDP e ICMP, com uso parec
 - Teste UDP com resposta, ICMP/ping e estatisticas por tentativa.
 - Modo continuo, equivalente ao `tcping64 -t host porta`.
 - Scan TCP de portas abertas em IP, DNS ou FQDN.
+- Tracert/Traceroute com exibicao dos saltos em tempo real.
 - Interface web responsiva em tempo real.
 - Backend em Python usando apenas biblioteca padrao.
 - Pacote Windows com servico nativo.
@@ -149,6 +150,7 @@ Abra a aplicacao no navegador e escolha o modo:
 
 - `Probe`: TCP, UDP ou ICMP.
 - `Port Scan`: scan TCP de portas abertas.
+- `Tracert`: rastreamento de rota ate o destino.
 
 No modo `Probe`, marque `Teste continuo (-t)` para manter os testes rodando ate parar manualmente.
 
@@ -163,6 +165,8 @@ all
 ```
 
 Use o scan apenas em hosts onde voce tem autorizacao.
+
+No modo `Tracert`, informe o host e o maximo de saltos. No Windows a aplicacao usa `tracert`; no Linux usa `traceroute` ou `tracepath`.
 
 ## API
 
@@ -190,6 +194,12 @@ Health check:
 http://127.0.0.1:8081/health
 ```
 
+Trace em tempo real via Server-Sent Events:
+
+```text
+http://127.0.0.1:8081/api/trace-stream?host=google.com&timeout=2&max_hops=30
+```
+
 ## Build Windows
 
 O executavel de servico foi gerado com PyInstaller usando `NetworkProbeService.spec`.
@@ -207,4 +217,5 @@ Depois copie `dist\NetworkProbeService.exe` para o pacote `release\NetworkProbe-
 - TCP mede o tempo de abertura da conexao.
 - UDP pode ficar inconclusivo se o host nao responder ao payload.
 - ICMP usa o comando `ping` do sistema operacional.
+- Tracert usa `tracert` no Windows e `traceroute` ou `tracepath` no Linux.
 - Jitter e a media da diferenca absoluta entre latencias bem-sucedidas consecutivas.

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import locale
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +34,7 @@ DEFAULT_PORT = 443
 DEFAULT_COUNT = 4
 DEFAULT_TIMEOUT = 2.0
 DEFAULT_INTERVAL = 1.0
+DEFAULT_TRACE_MAX_HOPS = 30
 
 MAX_COUNT = 100
 MIN_TIMEOUT = 0.1
@@ -40,6 +43,7 @@ MIN_INTERVAL = 0.0
 MAX_INTERVAL = 30.0
 MAX_SCAN_PORTS = 65535
 MAX_SCAN_CONCURRENCY = 512
+MAX_TRACE_HOPS = 255
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -478,7 +482,7 @@ INDEX_HTML = r"""<!doctype html>
 
         <div>
           <label>Modo</label>
-          <div class="segmented two" role="radiogroup" aria-label="Modo">
+          <div class="segmented" role="radiogroup" aria-label="Modo">
             <label>
               <input type="radio" name="mode" value="probe" checked />
               <span>Teste</span>
@@ -486,6 +490,10 @@ INDEX_HTML = r"""<!doctype html>
             <label>
               <input type="radio" name="mode" value="scan" />
               <span>Port Scan</span>
+            </label>
+            <label>
+              <input type="radio" name="mode" value="trace" />
+              <span>Tracert</span>
             </label>
           </div>
         </div>
@@ -534,6 +542,13 @@ INDEX_HTML = r"""<!doctype html>
               Mostrar fechadas
             </label>
           </div>
+        </div>
+
+        <div id="traceFields" hidden>
+          <label>
+            Max saltos
+            <input id="traceMaxHops" name="trace_max_hops" inputmode="numeric" pattern="[0-9]*" value="30" />
+          </label>
         </div>
 
         <label class="toggle-row">
@@ -622,6 +637,8 @@ INDEX_HTML = r"""<!doctype html>
     const scanPortsInput = document.querySelector("#scanPorts");
     const scanConcurrencyInput = document.querySelector("#scanConcurrency");
     const showClosedInput = document.querySelector("#showClosed");
+    const traceFields = document.querySelector("#traceFields");
+    const traceMaxHopsInput = document.querySelector("#traceMaxHops");
     const modeHint = document.querySelector("#modeHint");
 
     const MAX_LOG_LINES = 500;
@@ -703,6 +720,25 @@ INDEX_HTML = r"""<!doctype html>
       appendLine(`${prefix}: ${summary.open}/${summary.total} portas abertas, ${summary.closed} fechadas/filtradas, media ${ms(summary.avg_ms)}`, "info");
     }
 
+    function updateTraceSummary(summary) {
+      const data = summary || {
+        hops: stats.sent,
+        responded: stats.success,
+        timeouts: stats.sent - stats.success,
+        last_ms: stats.lastLatency,
+        elapsed_s: 0,
+      };
+      sentEl.textContent = data.hops;
+      successEl.textContent = data.responded;
+      lossEl.textContent = data.timeouts;
+      avgEl.textContent = ms(data.last_ms);
+      jitterEl.textContent = `${(data.elapsed_s || 0).toFixed(1)} s`;
+    }
+
+    function appendTraceSummary(prefix, summary) {
+      appendLine(`${prefix}: ${summary.hops} saltos, ${summary.responded} responderam, ${summary.timeouts} sem resposta, tempo ${summary.elapsed_s.toFixed(1)}s`, "info");
+    }
+
     function selectedMode() {
       return document.querySelector('input[name="mode"]:checked').value;
     }
@@ -718,17 +754,23 @@ INDEX_HTML = r"""<!doctype html>
     function updateProtocolFields() {
       const mode = selectedMode();
       const isScan = mode === "scan";
+      const isTrace = mode === "trace";
       const protocol = selectedProtocol();
-      const usesPort = !isScan && protocol !== "icmp";
-      protocolGroup.style.opacity = isScan ? "0.55" : "1";
+      const usesPort = !isScan && !isTrace && protocol !== "icmp";
+      protocolGroup.style.opacity = (isScan || isTrace) ? "0.55" : "1";
+      protocolInputs.forEach((input) => {
+        input.disabled = isScan || isTrace;
+      });
       portInput.disabled = !usesPort;
       portInput.required = usesPort;
       portLabel.style.opacity = usesPort ? "1" : "0.55";
-      countInput.disabled = isScan || continuousInput.checked;
-      continuousInput.disabled = isScan;
+      countInput.disabled = isScan || isTrace || continuousInput.checked;
+      continuousInput.disabled = isScan || isTrace;
       scanFields.hidden = !isScan;
       scanPortsInput.required = isScan;
       scanConcurrencyInput.required = isScan;
+      traceFields.hidden = !isTrace;
+      traceMaxHopsInput.required = isTrace;
 
       if (isScan) {
         sentLabel.textContent = "Testadas";
@@ -737,6 +779,16 @@ INDEX_HTML = r"""<!doctype html>
         avgLabel.textContent = "Media";
         jitterLabel.textContent = "Progresso";
         modeHint.textContent = "Port Scan faz conexoes TCP nas portas informadas e lista portas abertas. Use 1-65535, all, todas ou * para scan completo. Use apenas em hosts autorizados.";
+        return;
+      }
+
+      if (isTrace) {
+        sentLabel.textContent = "Saltos";
+        successLabel.textContent = "Respondidos";
+        lossLabel.textContent = "Sem resp.";
+        avgLabel.textContent = "Ultimo";
+        jitterLabel.textContent = "Tempo";
+        modeHint.textContent = "Tracert mostra a rota ate o destino. No Windows usa tracert; no Linux usa traceroute ou tracepath.";
         return;
       }
 
@@ -904,6 +956,70 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
 
+      if (mode === "trace") {
+        params.set("host", document.querySelector("#host").value);
+        params.set("max_hops", traceMaxHopsInput.value);
+        appendLine(`Tracert ${params.get("host")} com ate ${params.get("max_hops")} salto(s)`, "info");
+        setStatus("running", "Rastreando");
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        updateTraceSummary({ hops: 0, responded: 0, timeouts: 0, last_ms: null, elapsed_s: 0 });
+        source = new EventSource(`/api/trace-stream?${params.toString()}`);
+
+        source.addEventListener("trace_hop", (event) => {
+          const result = JSON.parse(event.data);
+          stats.sent += 1;
+          if (result.ok) {
+            stats.success += 1;
+            stats.lastLatency = result.latency_ms;
+            stats.latencySum += result.latency_ms || 0;
+          }
+          appendLine(result.raw_line || result.message, result.ok ? "ok" : "info");
+          addRow({
+            sequence: result.sequence,
+            ok: result.ok,
+            status: result.status,
+            latency_ms: result.latency_ms,
+            jitter_ms: null,
+            peer: result.peer,
+            host: result.host,
+            message: result.message,
+            timestamp: result.timestamp,
+          });
+          updateTraceSummary(result.summary);
+        });
+
+        source.addEventListener("trace_info", (event) => {
+          const result = JSON.parse(event.data);
+          appendLine(result.message, "info");
+        });
+
+        source.addEventListener("trace_error", (event) => {
+          const payload = JSON.parse(event.data);
+          appendLine(payload.error || "Erro no Tracert.", "fail");
+          setStatus("fail", "Erro");
+          closeSource();
+        });
+
+        source.addEventListener("trace_summary", (event) => {
+          const summary = JSON.parse(event.data);
+          updateTraceSummary(summary);
+          appendTraceSummary("Resumo tracert", summary);
+          setStatus(summary.hops > 0 ? "ok" : "fail", "Concluido");
+          closeSource();
+        });
+
+        source.addEventListener("error", () => {
+          if (!source) {
+            return;
+          }
+          appendLine("Conexao com o servidor encerrada ou indisponivel.", "fail");
+          setStatus("fail", "Erro");
+          closeSource();
+        });
+        return;
+      }
+
       const isContinuous = continuousInput.checked;
       if (isContinuous) {
         params.set("continuous", "1");
@@ -963,9 +1079,18 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     stopBtn.addEventListener("click", () => {
+      const mode = selectedMode();
       closeSource();
       setStatus("", "Interrompido");
       appendLine("Teste interrompido pelo usuario.", "info");
+      if (mode === "trace") {
+        updateTraceSummary();
+        return;
+      }
+      if (mode === "scan") {
+        updateScanSummary();
+        return;
+      }
       appendSummary("Resumo parcial");
     });
   </script>
@@ -983,6 +1108,13 @@ class ProbeConfig:
     timeout: float
     interval: float
     continuous: bool
+
+
+@dataclass(frozen=True)
+class TraceConfig:
+    host: str
+    timeout: float
+    max_hops: int
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -1057,6 +1189,14 @@ def parse_config(query: dict[str, list[str]]) -> ProbeConfig:
         timeout=parse_float(first_query_value(query, "timeout"), DEFAULT_TIMEOUT, MIN_TIMEOUT, MAX_TIMEOUT),
         interval=parse_float(first_query_value(query, "interval"), DEFAULT_INTERVAL, MIN_INTERVAL, MAX_INTERVAL),
         continuous=continuous,
+    )
+
+
+def parse_trace_config(query: dict[str, list[str]]) -> TraceConfig:
+    return TraceConfig(
+        host=clean_host(first_query_value(query, "host")),
+        timeout=parse_float(first_query_value(query, "timeout"), DEFAULT_TIMEOUT, MIN_TIMEOUT, MAX_TIMEOUT),
+        max_hops=parse_int(first_query_value(query, "max_hops") or first_query_value(query, "trace_max_hops"), DEFAULT_TRACE_MAX_HOPS, 1, MAX_TRACE_HOPS),
     )
 
 
@@ -1392,6 +1532,113 @@ def run_tcping(config: ProbeConfig) -> tuple[list[dict[str, Any]], dict[str, Any
     return results, summarize(results)
 
 
+def trace_command(config: TraceConfig) -> tuple[list[str], str]:
+    timeout_ms = max(1, int(config.timeout * 1000))
+    if sys.platform.startswith("win"):
+        return ["tracert", "-d", "-h", str(config.max_hops), "-w", str(timeout_ms), config.host], "tracert"
+
+    traceroute = shutil.which("traceroute")
+    if traceroute:
+        return [traceroute, "-n", "-w", f"{config.timeout:g}", "-q", "1", "-m", str(config.max_hops), config.host], "traceroute"
+
+    tracepath = shutil.which("tracepath")
+    if tracepath:
+        return [tracepath, "-n", "-m", str(config.max_hops), config.host], "tracepath"
+
+    raise FileNotFoundError("traceroute/tracepath nao encontrado. Instale o pacote traceroute ou iputils-tracepath.")
+
+
+def decode_process_line(raw_line: bytes) -> str:
+    preferred = locale.getpreferredencoding(False)
+    if sys.platform.startswith("win"):
+        encodings = ["utf-8", "cp850", "cp437", preferred, "cp1252", "latin-1"]
+    else:
+        encodings = ["utf-8", preferred, "latin-1"]
+    seen: set[str] = set()
+    for encoding in encodings:
+        if not encoding or encoding.lower() in seen:
+            continue
+        seen.add(encoding.lower())
+        try:
+            return raw_line.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw_line.decode(preferred or "utf-8", errors="replace")
+
+
+def extract_trace_latency_ms(text: str) -> float | None:
+    values: list[float] = []
+    for match in re.finditer(r"(<)?\s*([0-9]+(?:[,.][0-9]+)?)\s*ms", text, re.IGNORECASE):
+        value = float(match.group(2).replace(",", "."))
+        if match.group(1):
+            value = min(value, 0.5)
+        values.append(value)
+    return round(min(values), 3) if values else None
+
+
+def extract_trace_peer(text: str, has_latency: bool) -> str | None:
+    for pattern in (r"\[([0-9a-fA-F:.]+)\]", r"\(([0-9a-fA-F:.]+)\)"):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+
+    ipv4_matches = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
+    if ipv4_matches:
+        return ipv4_matches[-1]
+
+    if not has_latency and ("*" in text or "no reply" in text.lower()):
+        return None
+
+    for token in reversed(text.replace("[", " ").replace("]", " ").replace("(", " ").replace(")", " ").split()):
+        clean = token.strip(",;")
+        if not clean or clean == "*" or clean.lower() == "ms":
+            continue
+        if re.fullmatch(r"<?[0-9]+(?:[,.][0-9]+)?", clean):
+            continue
+        if ":" in clean and re.fullmatch(r"[0-9a-fA-F:.]+", clean):
+            return clean
+        if has_latency and not re.search(r"\d+\s*ms", clean, re.IGNORECASE):
+            return clean
+    return None
+
+
+def parse_trace_hop_line(line: str, host: str) -> dict[str, Any] | None:
+    match = re.match(r"^\s*(\d+)(?:\s+|:)\s*(.*)$", line)
+    if not match:
+        return None
+
+    hop = int(match.group(1))
+    rest = match.group(2).strip()
+    latency_ms = extract_trace_latency_ms(rest)
+    peer = extract_trace_peer(rest, latency_ms is not None)
+    status = "ok" if latency_ms is not None else "unknown"
+    return {
+        "sequence": hop,
+        "host": host,
+        "ok": latency_ms is not None,
+        "status": status,
+        "latency_ms": latency_ms,
+        "jitter_ms": None,
+        "peer": peer,
+        "message": rest or line.strip(),
+        "raw_line": line.strip(),
+        "timestamp": time.time(),
+    }
+
+
+def trace_summary(results: list[dict[str, Any]], started: float, exit_code: int | None) -> dict[str, Any]:
+    responded = [item for item in results if item.get("ok")]
+    last_latency = next((item.get("latency_ms") for item in reversed(responded) if item.get("latency_ms") is not None), None)
+    return {
+        "hops": len(results),
+        "responded": len(responded),
+        "timeouts": len(results) - len(responded),
+        "last_ms": round(float(last_latency), 3) if last_latency is not None else None,
+        "elapsed_s": round(time.perf_counter() - started, 3),
+        "exit_code": exit_code,
+    }
+
+
 def parse_ports(raw_ports: str | None) -> list[int]:
     text = (raw_ports or "").strip()
     if not text:
@@ -1646,6 +1893,9 @@ class TcpingHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/scan-stream":
             self.handle_scan_stream(parsed.query)
             return
+        if parsed.path == "/api/trace-stream":
+            self.handle_trace_stream(parsed.query)
+            return
         if parsed.path == "/health":
             self.send_json({"ok": True})
             return
@@ -1654,6 +1904,10 @@ class TcpingHandler(BaseHTTPRequestHandler):
     def parse_request_config(self, raw_query: str) -> ProbeConfig:
         query = parse_qs(raw_query, keep_blank_values=True)
         return parse_config(query)
+
+    def parse_trace_request(self, raw_query: str) -> TraceConfig:
+        query = parse_qs(raw_query, keep_blank_values=True)
+        return parse_trace_config(query)
 
     def handle_tcping(self, raw_query: str) -> None:
         try:
@@ -1822,6 +2076,65 @@ class TcpingHandler(BaseHTTPRequestHandler):
                 return
         except Exception as exc:
             self.send_event("scan_error", {"error": f"erro interno no Port Scan: {exc}"})
+
+    def handle_trace_stream(self, raw_query: str) -> None:
+        try:
+            config = self.parse_trace_request(raw_query)
+        except ValueError as exc:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            self.send_event("trace_error", {"error": str(exc)})
+            return
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+
+        try:
+            command, tool_name = trace_command(config)
+        except FileNotFoundError as exc:
+            self.send_event("trace_error", {"error": str(exc)})
+            return
+
+        started = time.perf_counter()
+        process: subprocess.Popen[bytes] | None = None
+        results: list[dict[str, Any]] = []
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.send_event("trace_info", {"message": f"Usando {tool_name} para rastrear {config.host}"})
+            if process.stdout is None:
+                self.send_event("trace_error", {"error": "nao foi possivel capturar a saida do tracert"})
+                return
+
+            for raw_line in process.stdout:
+                line = decode_process_line(raw_line).strip()
+                if not line:
+                    continue
+                hop = parse_trace_hop_line(line, config.host)
+                if hop is None:
+                    if not self.send_event("trace_info", {"message": line, "timestamp": time.time()}):
+                        return
+                    continue
+
+                results.append(hop)
+                hop["summary"] = trace_summary(results, started, None)
+                if not self.send_event("trace_hop", hop):
+                    return
+
+            exit_code = process.wait(timeout=2)
+            self.send_event("trace_summary", trace_summary(results, started, exit_code))
+        except Exception as exc:
+            self.send_event("trace_error", {"error": f"erro interno no Tracert: {exc}"})
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
 
     def send_html(self, html: str) -> None:
         body = html.encode("utf-8")
